@@ -71,12 +71,26 @@ option(LIBRW_TOOLS "Build librw tools" ${librw_MAINPROJECT})
 option(LIBRW_INSTALL "Install librw files" ${librw_MAINPROJECT})
 cmake_dependent_option(LIBRW_EXAMPLES "Build librw examples" ON "LIBRW_TOOLS;NOT LIBRW_PLATFORM_NULL" OFF)
 
+# ANGLE (GLES on Metal), mac only, built via build_angle.sh
+cmake_dependent_option(LIBRW_BUILD_ANGLE "Build ANGLE libEGL/libGLESv2 from vendor/angle"
+    ON "LIBRW_PLATFORM_GL3;APPLE" OFF)
+
 if(LIBRW_INSTALL)
     include(GNUInstallDirs)
     set(LIBRW_INSTALL_INCLUDEDIR "${CMAKE_INSTALL_INCLUDEDIR}/librw")
 endif()
 
 add_subdirectory(src)
+
+if(LIBRW_BUILD_ANGLE)
+    add_custom_target(angle
+        COMMAND "${CMAKE_CURRENT_LIST_DIR}/build_angle.sh" "${CMAKE_BINARY_DIR}/angle"
+        COMMENT "Building ANGLE (libEGL/libGLESv2, Metal backend)"
+        USES_TERMINAL
+        VERBATIM
+    )
+    add_dependencies(librw angle)
+endif()
 
 if(LIBRW_TOOLS AND NOT LIBRW_PLATFORM_PS2 AND NOT LIBRW_PLATFORM_NULL)
     add_subdirectory(skeleton)

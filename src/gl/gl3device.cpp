@@ -99,6 +99,14 @@ const char *shaderDecl310es =
 "#define FRAGCOLOR(c) (fragColor = c)\n"
 "precision highp float;\n"
 "precision highp int;\n";
+const char *shaderDecl300es =
+"#version 300 es\n"
+"#define VSIN(index) layout(location = index) in\n"
+"#define VSOUT out\n"
+"#define FSIN in\n"
+"#define FRAGCOLOR(c) (fragColor = c)\n"
+"precision highp float;\n"
+"precision highp int;\n";
 
 const char *shaderDecl;
 
@@ -1834,6 +1842,19 @@ makeVideoModeList(GLFWmonitor *monitor)
 	}
 }
 
+// ANGLE (GLES on Metal), mac only; set DISABLE_ANGLE to force native GL
+#if defined(__APPLE__) && defined(GLFW_ANGLE_PLATFORM_TYPE) && defined(GLFW_CONTEXT_CREATION_API)
+#define LIBRW_ANGLE
+#endif
+
+#ifdef LIBRW_ANGLE
+static bool
+useAngle(void)
+{
+	return getenv("DISABLE_ANGLE") == nil;
+}
+#endif
+
 static int
 openGLFW(EngineOpenParams *openparams)
 {
@@ -1843,6 +1864,11 @@ openGLFW(EngineOpenParams *openparams)
 	glGlobals.pWindow = openparams->window;
 
 	memset(&gl3Caps, 0, sizeof(gl3Caps));
+
+#ifdef LIBRW_ANGLE
+	if(useAngle())
+		glfwInitHint(GLFW_ANGLE_PLATFORM_TYPE, GLFW_ANGLE_PLATFORM_TYPE_METAL);
+#endif
 
 	/* Init GLFW */
 	if(!glfwInit()){
@@ -1870,16 +1896,25 @@ glfwerr(int error, const char *desc)
 	fprintf(stderr, "GLFW Error: %s\n", desc);
 }
 
-static struct {
+static struct GlProfile {
 	int gl;
 	int major, minor;
 } profiles[] = {
 	{ GLFW_OPENGL_API, 3, 3 },
 	{ GLFW_OPENGL_API, 2, 1 },
 	{ GLFW_OPENGL_ES_API, 3, 1 },
+	{ GLFW_OPENGL_ES_API, 3, 0 },
 	{ GLFW_OPENGL_ES_API, 2, 0 },
 	{ 0, 0, 0 },
 };
+#ifdef LIBRW_ANGLE
+// ANGLE Metal tops out at ES 3.0
+static GlProfile angleProfiles[] = {
+	{ GLFW_OPENGL_ES_API, 3, 0 },
+	{ GLFW_OPENGL_ES_API, 2, 0 },
+	{ 0, 0, 0 },
+};
+#endif
 
 static int
 startGLFW(void)
@@ -1900,22 +1935,41 @@ startGLFW(void)
 	if (glGlobals.numSamples > 1)
 		glfwWindowHint(GLFW_SAMPLES, glGlobals.numSamples);
 
-	int i;
-	for(i = 0; profiles[i].gl; i++){
-		glfwWindowHint(GLFW_CLIENT_API, profiles[i].gl);
-		glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, profiles[i].major);
-		glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, profiles[i].minor);
+	int tryAngle = 0;
+#ifdef LIBRW_ANGLE
+	tryAngle = useAngle();
+#endif
 
-		if(mode->flags & VIDEOMODEEXCLUSIVE)
-			win = glfwCreateWindow(mode->mode.width, mode->mode.height, glGlobals.winTitle, glGlobals.monitor, nil);
-		else
-			win = glfwCreateWindow(glGlobals.winWidth, glGlobals.winHeight, glGlobals.winTitle, nil, nil);
-		if(win){
-			gl3Caps.gles = profiles[i].gl == GLFW_OPENGL_ES_API;
-			gl3Caps.glversion = profiles[i].major*10 + profiles[i].minor;
-			break;
+	int i;
+	win = nil;
+	do{
+		const GlProfile *profs = profiles;
+#ifdef LIBRW_ANGLE
+		if(tryAngle){
+			glfwWindowHint(GLFW_CONTEXT_CREATION_API, GLFW_EGL_CONTEXT_API);
+			profs = angleProfiles;
+		}else
+			glfwWindowHint(GLFW_CONTEXT_CREATION_API, GLFW_NATIVE_CONTEXT_API);
+#endif
+
+		for(i = 0; profs[i].gl; i++){
+			glfwWindowHint(GLFW_CLIENT_API, profs[i].gl);
+			glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, profs[i].major);
+			glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, profs[i].minor);
+
+			if(mode->flags & VIDEOMODEEXCLUSIVE)
+				win = glfwCreateWindow(mode->mode.width, mode->mode.height, glGlobals.winTitle, glGlobals.monitor, nil);
+			else
+				win = glfwCreateWindow(glGlobals.winWidth, glGlobals.winHeight, glGlobals.winTitle, nil, nil);
+			if(win){
+				gl3Caps.gles = profs[i].gl == GLFW_OPENGL_ES_API;
+				gl3Caps.glversion = profs[i].major*10 + profs[i].minor;
+				break;
+			}
 		}
-	}
+		if(win == nil && tryAngle)
+			fprintf(stderr, "ANGLE unavailable, falling back to native GL\n");
+	}while(win == nil && tryAngle--);
 	if(win == nil){
 		RWERROR((ERR_GENERAL, "glfwCreateWindow() failed"));
 		return 0;
@@ -1975,8 +2029,10 @@ initOpenGL(void)
 	glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &gl3Caps.maxAnisotropy);
 
 	if(gl3Caps.gles){
-		if(gl3Caps.glversion >= 30)
+		if(gl3Caps.glversion >= 31)
 			shaderDecl = shaderDecl310es;
+		else if(gl3Caps.glversion >= 30)
+			shaderDecl = shaderDecl300es;
 		else
 			shaderDecl = shaderDecl100es;
 	}else{
