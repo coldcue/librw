@@ -286,6 +286,7 @@ struct Gl3Caps
 	bool dxtSupported;
 	bool astcSupported;	// not used yet
 	float maxAnisotropy;
+	bool floatBackbuffer;	// FP16 default framebuffer (EDR)
 };
 extern Gl3Caps gl3Caps;
 // GLES can't read back textures very nicely.

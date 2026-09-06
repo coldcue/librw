@@ -1,0 +1,78 @@
+diff --git a/src/libANGLE/renderer/metal/DisplayMtl.mm b/src/libANGLE/renderer/metal/DisplayMtl.mm
+index ba764ae576..9a9e93fbb1 100644
+--- a/src/libANGLE/renderer/metal/DisplayMtl.mm
++++ b/src/libANGLE/renderer/metal/DisplayMtl.mm
+@@ -585,6 +585,14 @@ bool IsMetalDisplayAvailable()
+ 
+     config.colorComponentType = EGL_COLOR_COMPONENT_TYPE_FIXED_EXT;
+ 
++    // FP16 backbuffer for EDR output; the buffer bit sizes stay at 8 so
++    // window-system glue (GLFW) matching 8-bit visuals still picks the config.
++    if (getenv("ANGLE_METAL_EDR") != nullptr)
++    {
++        config.renderTargetFormat = GL_RGBA16F;
++        config.colorComponentType = EGL_COLOR_COMPONENT_TYPE_FLOAT_EXT;
++    }
++
+     constexpr int samplesSupported[] = {0, 4};
+ 
+     for (int samples : samplesSupported)
+diff --git a/src/libANGLE/renderer/metal/SurfaceMtl.mm b/src/libANGLE/renderer/metal/SurfaceMtl.mm
+index 1f41ff54d2..d0f36a86cd 100644
+--- a/src/libANGLE/renderer/metal/SurfaceMtl.mm
++++ b/src/libANGLE/renderer/metal/SurfaceMtl.mm
+@@ -84,7 +84,14 @@
+ {
+     mRobustResourceInit =
+         attribs.get(EGL_ROBUST_RESOURCE_INITIALIZATION_ANGLE, EGL_FALSE) == EGL_TRUE;
+-    mColorFormat = display->getPixelFormat(angle::FormatID::B8G8R8A8_UNORM);
++    if (state.config != nullptr && state.config->renderTargetFormat == GL_RGBA16F)
++    {
++        mColorFormat = display->getPixelFormat(angle::FormatID::R16G16B16A16_FLOAT);
++    }
++    else
++    {
++        mColorFormat = display->getPixelFormat(angle::FormatID::B8G8R8A8_UNORM);
++    }
+ 
+     mSamples = state.config->samples;
+ 
+@@ -462,6 +469,38 @@
+         mMetalLayer.get().pixelFormat     = mColorFormat.metalFormat;
+         mMetalLayer.get().framebufferOnly = NO;  // Support blitting and glReadPixels
+ 
++#if TARGET_OS_OSX || TARGET_OS_MACCATALYST
++        if (mColorFormat.metalFormat == MTLPixelFormatRGBA16Float)
++        {
++            mMetalLayer.get().wantsExtendedDynamicRangeContent = YES;
++            // Content is sRGB-encoded. The stock BGRA8 path left the layer
++            // untagged, so the P3 panel showed the values without matching;
++            // extended Display P3 reproduces that look while >1.0 reaches EDR
++            // headroom. (An untagged float layer is treated as linear, and
++            // extended sRGB shows accurate-but-muted colors.)
++            const char *csName = getenv("ANGLE_METAL_EDR_COLORSPACE");
++            CFStringRef csId   = kCGColorSpaceExtendedDisplayP3;
++            if (csName != nullptr && csName[0] == 'n')
++            {
++                csId = nullptr;
++            }
++            else if (csName != nullptr && csName[0] == 'l')
++            {
++                csId = kCGColorSpaceExtendedLinearSRGB;
++            }
++            else if (csName != nullptr && csName[0] == 's')
++            {
++                csId = kCGColorSpaceExtendedSRGB;
++            }
++            if (csId != nullptr)
++            {
++                CGColorSpaceRef cs           = CGColorSpaceCreateWithName(csId);
++                mMetalLayer.get().colorspace = cs;
++                CGColorSpaceRelease(cs);
++            }
++        }
++#endif
++
+ #if TARGET_OS_OSX || TARGET_OS_MACCATALYST
+         // Autoresize with parent layer.
+         mMetalLayer.get().autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;

@@ -1460,6 +1460,46 @@ rasterRenderFast(Raster *raster, int32 x, int32 y)
 	case Raster::CAMERATEXTURE:
 		switch(src->type){
 		case Raster::CAMERA:
+			if(natdst->type == GL_HALF_FLOAT){
+				// ANGLE rejects glCopyTexSubImage2D from a float framebuffer,
+				// and a multisampled backbuffer only allows same-bounds blits.
+				// So: same-bounds blit (resolving MSAA) into a scratch FBO,
+				// then an offset blit from there into the camera texture.
+				static GLuint scratchFbo, scratchTex;
+				static int32 scratchW, scratchH;
+				GLint prevFbo;
+				glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFbo);
+				if(scratchW != src->width || scratchH != src->height){
+					if(scratchFbo){
+						glDeleteFramebuffers(1, &scratchFbo);
+						glDeleteTextures(1, &scratchTex);
+					}
+					glGenTextures(1, &scratchTex);
+					uint32 prevTex = bindTexture(scratchTex);
+					glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, src->width, src->height,
+						0, GL_RGBA, GL_HALF_FLOAT, nil);
+					bindTexture(prevTex);
+					glGenFramebuffers(1, &scratchFbo);
+					glBindFramebuffer(GL_FRAMEBUFFER, scratchFbo);
+					glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+						GL_TEXTURE_2D, scratchTex, 0);
+					scratchW = src->width;
+					scratchH = src->height;
+				}
+				glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+				glBindFramebuffer(GL_DRAW_FRAMEBUFFER, scratchFbo);
+				glBlitFramebuffer(0, 0, src->width, src->height,
+					0, 0, src->width, src->height,
+					GL_COLOR_BUFFER_BIT, GL_NEAREST);
+				glBindFramebuffer(GL_READ_FRAMEBUFFER, scratchFbo);
+				glBindFramebuffer(GL_DRAW_FRAMEBUFFER, natdst->fbo);
+				int32 dsty = (dst->height-src->height)-y;
+				glBlitFramebuffer(0, 0, src->width, src->height,
+					x, dsty, x+src->width, dsty+src->height,
+					GL_COLOR_BUFFER_BIT, GL_NEAREST);
+				glBindFramebuffer(GL_FRAMEBUFFER, prevFbo);
+				return 1;
+			}
 			setActiveTexture(0);
 			glBindTexture(GL_TEXTURE_2D, natdst->texid);
 			glCopyTexSubImage2D(GL_TEXTURE_2D, 0, x, (dst->height-src->height)-y,
@@ -1943,6 +1983,12 @@ startGLFW(void)
 	int tryAngle = 0;
 #ifdef LIBRW_ANGLE
 	tryAngle = useAngle();
+	// FP16 EDR backbuffer (see angle-edr.patch); must be set before the
+	// EGL surface is created. Set DISABLE_EDR to keep the 8-bit backbuffer.
+	if(tryAngle && getenv("DISABLE_EDR") == nil)
+		setenv("ANGLE_METAL_EDR", "1", 1);
+	else
+		unsetenv("ANGLE_METAL_EDR");
 #endif
 
 	int i;
@@ -1989,6 +2035,23 @@ startGLFW(void)
 	}
 
 //	printf("OpenGL version: %s\n", glGetString(GL_VERSION));
+
+	// Probe for the FP16 (EDR) backbuffer: values above 1.0 survive a
+	// clear+readback only on a float buffer. The attachment queries can't be
+	// used instead -- ANGLE answers those from its 8-bit EGL config.
+	gl3Caps.floatBackbuffer = 0;
+	if(gl3Caps.gles && gl3Caps.glversion >= 30){
+		float pix[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+		glClearColor(2.0f, 0.0f, 0.0f, 1.0f);
+		glClear(GL_COLOR_BUFFER_BIT);
+		glReadPixels(0, 0, 1, 1, GL_RGBA, GL_FLOAT, pix);
+		while(glGetError() != GL_NO_ERROR);	// unorm buffers reject the float read
+		gl3Caps.floatBackbuffer = pix[0] > 1.5f;
+		glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+		glClear(GL_COLOR_BUFFER_BIT);
+	}
+	if(gl3Caps.floatBackbuffer)
+		fprintf(stderr, "EDR: FP16 backbuffer active\n");
 
 	glGlobals.window = win;
 	*glGlobals.pWindow = win;

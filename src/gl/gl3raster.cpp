@@ -140,6 +140,19 @@ rasterCreateTexture(Raster *raster)
 	return raster;
 }
 
+static uint16
+floatToHalf(float f)
+{
+	union { float f; uint32 u; } v;
+	v.f = f;
+	uint32 sign = (v.u >> 16) & 0x8000;
+	int32 exp = ((v.u >> 23) & 0xFF) - 127 + 15;
+	uint32 mant = (v.u >> 13) & 0x3FF;
+	if(exp <= 0) return sign;
+	if(exp >= 31) return sign | 0x7C00;
+	return sign | exp << 10 | mant;
+}
+
 static Raster*
 rasterCreateCameraTexture(Raster *raster)
 {
@@ -182,6 +195,15 @@ rasterCreateCameraTexture(Raster *raster)
 //		natras->format = GL_RGBA;
 //		natras->type = GL_UNSIGNED_BYTE;
 //		natras->bpp = 4;
+	}
+
+	// GLES forbids colour copies from a float framebuffer into unorm
+	// textures, so with an FP16 backbuffer camera textures go FP16 too
+	if(gl3Caps.floatBackbuffer && (raster->format & 0xF00) != Raster::C1555){
+		natras->internalFormat = GL_RGBA16F;
+		natras->format = GL_RGBA;
+		natras->type = GL_HALF_FLOAT;
+		natras->bpp = 8;
 	}
 
 	raster->stride = raster->width*natras->bpp;
@@ -484,8 +506,19 @@ rasterLock(Raster *raster, int32 level, int32 lockMode)
 				bindFramebuffer(fbo);
 				glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, natras->texid, 0);
 				GLenum e = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+				if(natras->type == GL_HALF_FLOAT){
+					// float attachments can only be read back as GL_FLOAT
+					uint32 n = raster->width*raster->height*4;
+					float *tmp = (float*)rwMalloc(n*sizeof(float), MEMDUR_EVENT | ID_DRIVER);
+					glReadPixels(0, 0, raster->width, raster->height, GL_RGBA, GL_FLOAT, tmp);
+					uint16 *hp = (uint16*)px;
+					for(uint32 i = 0; i < n; i++)
+						hp[i] = floatToHalf(tmp[i]);
+					rwFree(tmp);
+				}else{
 assert(natras->format == GL_RGBA);
 				glReadPixels(0, 0, raster->width, raster->height, natras->format, natras->type, px);
+				}
 //e = glGetError(); printf("GL err4 %x (%x)\n", e, natras->format);
 				bindFramebuffer(0);
 				glDeleteFramebuffers(1, &fbo);
@@ -512,7 +545,21 @@ assert(natras->format == GL_RGBA);
 		assert(raster->pixels == nil);
 		raster->pixels = px;
 		glReadBuffer(GL_BACK);
-		glReadPixels(0, 0, raster->width, raster->height, GL_RGB, GL_UNSIGNED_BYTE, px);
+		if(gl3Caps.floatBackbuffer){
+			// callers expect 8-bit RGB; read float and clamp
+			uint32 n = raster->width*raster->height;
+			float *tmp = (float*)rwMalloc(n*4*sizeof(float), MEMDUR_EVENT | ID_DRIVER);
+			glReadPixels(0, 0, raster->width, raster->height, GL_RGBA, GL_FLOAT, tmp);
+			for(uint32 i = 0; i < n; i++)
+				for(uint32 j = 0; j < 3; j++){
+					float c = tmp[i*4+j];
+					if(c < 0.0f) c = 0.0f;
+					if(c > 1.0f) c = 1.0f;
+					px[i*3+j] = (uint8)(c*255.0f + 0.5f);
+				}
+			rwFree(tmp);
+		}else
+			glReadPixels(0, 0, raster->width, raster->height, GL_RGB, GL_UNSIGNED_BYTE, px);
 
 		raster->privateFlags = lockMode;
 		break;
