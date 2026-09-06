@@ -106,19 +106,21 @@ rasterCreateTexture(Raster *raster)
 
 	raster->stride = raster->width*natras->bpp;
 
-	if(raster->format & Raster::MIPMAP){
+	int32 fullChainLevels = 1;
+	{
 		int w = raster->width;
 		int h = raster->height;
-		natras->numLevels = 1;
 		while(w != 1 || h != 1){
-			natras->numLevels++;
+			fullChainLevels++;
 			if(w > 1) w /= 2;
 			if(h > 1) h /= 2;
 		}
 	}
+	if(raster->format & Raster::MIPMAP)
+		natras->numLevels = fullChainLevels;
 	natras->autogenMipmap = (raster->format & (Raster::MIPMAP|Raster::AUTOMIPMAP)) == (Raster::MIPMAP|Raster::AUTOMIPMAP);
 	if(natras->autogenMipmap)
-		natras->numLevels = 1;
+		natras->numLevels = 1;	// only level 0 is locked/unlocked; glGenerateMipmap fills the rest
 
 	glGenTextures(1, &natras->texid);
 	uint32 prev = bindTexture(natras->texid);
@@ -126,7 +128,9 @@ rasterCreateTexture(Raster *raster)
 	             raster->width, raster->height,
 	             0, natras->format, natras->type, nil);
 	// TODO: allocate other levels...probably
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, natras->numLevels-1);
+	// MAX_LEVEL must cover the generated chain, not just the lockable levels
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL,
+	                (natras->autogenMipmap ? fullChainLevels : natras->numLevels)-1);
 	natras->filterMode = 0;
 	natras->addressU = 0;
 	natras->addressV = 0;
@@ -313,9 +317,8 @@ allocateDXT(Raster *raster, int32 dxt, int32 numLevels, bool32 hasAlpha)
 	natras->isCompressed = 1;
 	if(raster->format & Raster::MIPMAP)
 		natras->numLevels = numLevels;
-	natras->autogenMipmap = (raster->format & (Raster::MIPMAP|Raster::AUTOMIPMAP)) == (Raster::MIPMAP|Raster::AUTOMIPMAP);
-	if(natras->autogenMipmap)
-		natras->numLevels = 1;
+	// glGenerateMipmap is invalid on compressed formats (GLES rejects it outright)
+	natras->autogenMipmap = 0;
 
 	glGenTextures(1, &natras->texid);
 	uint32 prev = bindTexture(natras->texid);

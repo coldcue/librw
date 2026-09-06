@@ -496,6 +496,8 @@ xbox_to_gl3(rw::Raster *ras)
 #endif
 }
 
+bool32 buildMipmapsOnConvert;
+
 rw::Raster*
 Raster::convertTexToCurrentPlatform(rw::Raster *ras)
 {
@@ -508,8 +510,14 @@ Raster::convertTexToCurrentPlatform(rw::Raster *ras)
 	   (ras->platform == PLATFORM_D3D9 && rw::platform == PLATFORM_D3D8))
 		return ras;
 
+	// textures that need a generated mip chain must take the Image path below;
+	// the raw-copy conversions would keep them as single-level (possibly DXT,
+	// which glGenerateMipmap can't handle)
+	bool32 genMipmaps = buildMipmapsOnConvert && ras->getNumLevels() == 1;
+
 	// special cased conversion for DXT
-	if((ras->platform == PLATFORM_D3D8 || ras->platform == PLATFORM_D3D9) && rw::platform == PLATFORM_GL3){
+	if(!genMipmaps &&
+	   (ras->platform == PLATFORM_D3D8 || ras->platform == PLATFORM_D3D9) && rw::platform == PLATFORM_GL3){
 		Raster *newras = d3d_to_gl3(ras);
 		if(newras){
 			ras->destroy();
@@ -536,6 +544,8 @@ Raster::convertTexToCurrentPlatform(rw::Raster *ras)
 	img->unpalettize();
 	Raster::imageFindRasterFormat(img, Raster::TEXTURE, &width, &height, &depth, &format);
 	format |= ras->format & (Raster::MIPMAP | Raster::AUTOMIPMAP);
+	if(genMipmaps)
+		format |= Raster::MIPMAP | Raster::AUTOMIPMAP;
 	Raster *newras = Raster::create(width, height, depth, format);
 	newras->setFromImage(img);
 	img->destroy();

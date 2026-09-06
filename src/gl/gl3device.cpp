@@ -525,11 +525,11 @@ static GLint addressConvMap[] = {
 static void
 setFilterMode(uint32 stage, int32 filter, int32 maxAniso = 1)
 {
+	Raster *raster = rwStateCache.texstage[stage].raster;
 	if(rwStateCache.texstage[stage].filter != (Texture::FilterMode)filter){
 		rwStateCache.texstage[stage].filter = (Texture::FilterMode)filter;
-		Raster *raster = rwStateCache.texstage[stage].raster;
 		if(raster){
-			Gl3Raster *natras = PLUGINOFFSET(Gl3Raster, rwStateCache.texstage[stage].raster, nativeRasterOffset);
+			Gl3Raster *natras = PLUGINOFFSET(Gl3Raster, raster, nativeRasterOffset);
 			if(natras->filterMode != filter){
 				setActiveTexture(stage);
 				if(natras->autogenMipmap || natras->numLevels > 1){
@@ -541,11 +541,16 @@ setFilterMode(uint32 stage, int32 filter, int32 maxAniso = 1)
 				}
 				natras->filterMode = filter;
 			}
-			if(natras->maxAnisotropy != maxAniso){
-				setActiveTexture(stage);
-				glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, (float)maxAniso);
-				natras->maxAnisotropy = maxAniso;
-			}
+		}
+	}
+	// anisotropy is per-raster state, so it can't hide behind the
+	// filter-mode cache check above
+	if(raster && GLAD_GL_EXT_texture_filter_anisotropic){
+		Gl3Raster *natras = PLUGINOFFSET(Gl3Raster, raster, nativeRasterOffset);
+		if(natras->maxAnisotropy != maxAniso){
+			setActiveTexture(stage);
+			glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, (float)maxAniso);
+			natras->maxAnisotropy = maxAniso;
 		}
 	}
 }
@@ -2026,7 +2031,10 @@ initOpenGL(void)
 	gl3Caps.dxtSupported = !!GLAD_GL_EXT_texture_compression_s3tc;
 	gl3Caps.astcSupported = !!GLAD_GL_KHR_texture_compression_astc_ldr;
 
-	glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &gl3Caps.maxAnisotropy);
+	if(GLAD_GL_EXT_texture_filter_anisotropic)
+		glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &gl3Caps.maxAnisotropy);
+	else
+		gl3Caps.maxAnisotropy = 1.0f;
 
 	if(gl3Caps.gles){
 		if(gl3Caps.glversion >= 31)
@@ -2080,7 +2088,10 @@ initOpenGL(void)
 
 	resetRenderState();
 
-	glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &maxAnisotropy);
+	if(GLAD_GL_EXT_texture_filter_anisotropic)
+		glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &maxAnisotropy);
+	else
+		maxAnisotropy = 1.0f;
 
 	if(gl3Caps.glversion >= 30){
 		glGenVertexArrays(1, &vao);

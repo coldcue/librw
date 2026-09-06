@@ -218,6 +218,10 @@ struct RasterLevels
 	} levels[1];	// 0 is illegal :/
 };
 
+// when set, convertTexToCurrentPlatform gives mip-less textures an
+// auto-generated mip chain (decompressing DXT if necessary)
+extern bool32 buildMipmapsOnConvert;
+
 struct Raster
 {
 	enum { FLIPWAITVSYNCH = 1 };
