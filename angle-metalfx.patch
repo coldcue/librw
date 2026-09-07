@@ -55,7 +55,7 @@
  // Compiler can turn on programmatical frame capture in release build by defining
  // ANGLE_METAL_FRAME_CAPTURE flag.
  #if defined(NDEBUG) && !defined(ANGLE_METAL_FRAME_CAPTURE)
-@@ -422,6 +429,30 @@
+@@ -422,6 +429,22 @@
  {
      // NOTE(hqle): Width and height attributes is ignored for now.
      mCurrentKnownDrawableSize = CGSizeMake(0, 0);
@@ -72,14 +72,6 @@
 +            {
 +                mUpscalePct = static_cast<uint32_t>(pct);
 +            }
-+        }
-+        if (mUpscalePct != 0 && mSamples <= 1)
-+        {
-+            // Anti-alias the internal render target: 4x MSAA, resolved into
-+            // the offscreen texture before the scaler runs. Clean edges
-+            // matter most when the image is upscaled; a config-requested
-+            // (in-game MSAA option) sample count takes precedence.
-+            mSamples = 4;
 +        }
 +    }
 +#endif
