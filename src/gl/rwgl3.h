@@ -287,8 +287,13 @@ struct Gl3Caps
 	bool astcSupported;	// not used yet
 	float maxAnisotropy;
 	bool floatBackbuffer;	// FP16 default framebuffer (EDR)
+	bool usingAngle;	// context runs on ANGLE (GLES on Metal, mac only)
 };
 extern Gl3Caps gl3Caps;
+
+// Maps output (window) pixels to the MetalFX internal render resolution;
+// identity when upscaling is inactive. See angle-metalfx.patch.
+void mapMetalFXSize(int32 *w, int32 *h);
 // GLES can't read back textures very nicely.
 // In most cases that's not an issue, but when it is,
 // this has to be set before the texture is filled:

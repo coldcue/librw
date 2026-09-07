@@ -1,0 +1,387 @@
+--- a/src/libANGLE/renderer/metal/SurfaceMtl.h
++++ b/src/libANGLE/renderer/metal/SurfaceMtl.h
+@@ -19,6 +19,8 @@
+ #include "libANGLE/renderer/metal/mtl_resources.h"
+ #include "libANGLE/renderer/metal/mtl_state_cache.h"
+ 
++@protocol MTLFXSpatialScaler;
++
+ namespace rx
+ {
+ 
+@@ -173,6 +175,14 @@
+     // Check if metal layer has been resized.
+     bool checkIfLayerResized(const gl::Context *context);
+ 
++    // MetalFX spatial upscaling (ANGLE_METAL_FX=<pct>): GLES renders into an
++    // offscreen texture at pct% of the drawable size; at swap the scaler
++    // upscales it into the drawable.
++    bool upscaleActive() const { return mUpscalePct != 0; }
++    CGSize calcInternalSize(const CGSize &drawableSize) const;
++    angle::Result ensureOffscreenColorTexture(const gl::Context *context);
++    angle::Result encodeUpscaleAndPresent(const gl::Context *context);
++
+     angle::ObjCPtr<CAMetalLayer> mMetalLayer = nil;
+     CALayer *mLayer;
+     angle::ObjCPtr<id<CAMetalDrawable>> mCurrentDrawable = nil;
+@@ -183,6 +193,14 @@
+     CGSize mCurrentKnownDrawableSize;
+ 
+     bool mRetainBuffer = false;
++
++    uint32_t mUpscalePct = 0;  // 0 = MetalFX upscaling disabled
++    angle::ObjCPtr<id<MTLFXSpatialScaler>> mSpatialScaler = nil;
++    CGSize mScalerInputSize  = CGSizeMake(0, 0);
++    CGSize mScalerOutputSize = CGSizeMake(0, 0);
++    // Whether the offscreen color texture has been handed out for rendering
++    // since the last swap; replaces mCurrentDrawable as the per-frame marker.
++    bool mFrameDirty = false;
+ };
+ 
+ // Offscreen surface, base class of PBuffer.
+--- a/src/libANGLE/renderer/metal/SurfaceMtl.mm
++++ b/src/libANGLE/renderer/metal/SurfaceMtl.mm
+@@ -20,6 +20,13 @@
+ #include "libANGLE/renderer/metal/mtl_utils.h"
+ #include "mtl_command_buffer.h"
+ 
++#if (TARGET_OS_OSX || TARGET_OS_MACCATALYST) && __has_include(<MetalFX/MetalFX.h>)
++#    import <MetalFX/MetalFX.h>
++#    define ANGLE_METAL_FX_AVAILABLE 1
++#else
++#    define ANGLE_METAL_FX_AVAILABLE 0
++#endif
++
+ // Compiler can turn on programmatical frame capture in release build by defining
+ // ANGLE_METAL_FRAME_CAPTURE flag.
+ #if defined(NDEBUG) && !defined(ANGLE_METAL_FRAME_CAPTURE)
+@@ -422,6 +429,30 @@
+ {
+     // NOTE(hqle): Width and height attributes is ignored for now.
+     mCurrentKnownDrawableSize = CGSizeMake(0, 0);
++
++#if ANGLE_METAL_FX_AVAILABLE
++    if (@available(macOS 13.0, macCatalyst 16.0, *))
++    {
++        const char *pctStr = getenv("ANGLE_METAL_FX");
++        if (pctStr != nullptr)
++        {
++            int pct = atoi(pctStr);
++            // 50% is the smallest scale the [1,2] spatial-scaler range allows
++            if (pct >= 50 && pct < 100)
++            {
++                mUpscalePct = static_cast<uint32_t>(pct);
++            }
++        }
++        if (mUpscalePct != 0 && mSamples <= 1)
++        {
++            // Anti-alias the internal render target: 4x MSAA, resolved into
++            // the offscreen texture before the scaler runs. Clean edges
++            // matter most when the image is upscaled; a config-requested
++            // (in-game MSAA option) sample count takes precedence.
++            mSamples = 4;
++        }
++    }
++#endif
+ }
+ 
+ WindowSurfaceMtl::~WindowSurfaceMtl() {}
+@@ -431,6 +462,7 @@
+     SurfaceMtl::destroy(display);
+ 
+     mCurrentDrawable = nil;
++    mSpatialScaler   = nil;
+     if (mMetalLayer && mMetalLayer.get() != mLayer)
+     {
+         // If we created metal layer in WindowSurfaceMtl::initialize(),
+@@ -536,8 +568,14 @@
+ // size can change with client window resizing
+ gl::Extents WindowSurfaceMtl::getSize() const
+ {
+-    return gl::Extents(static_cast<EGLint>(mCurrentKnownDrawableSize.width),
+-                       static_cast<EGLint>(mCurrentKnownDrawableSize.height), 1);
++    CGSize size = mCurrentKnownDrawableSize;
++    if (upscaleActive())
++    {
++        // GLES sees the internal render resolution; the drawable keeps the
++        // full layer size and receives the upscaled image at swap.
++        size = calcInternalSize(size);
++    }
++    return gl::Extents(static_cast<EGLint>(size.width), static_cast<EGLint>(size.height), 1);
+ }
+ 
+ EGLint WindowSurfaceMtl::getSwapBehavior() const
+@@ -585,7 +623,9 @@
+ 
+ angle::Result WindowSurfaceMtl::ensureCurrentDrawableObtained(const gl::Context *context)
+ {
+-    if (!mCurrentDrawable)
++    // With upscaling active no drawable is held during the frame; the
++    // offscreen color texture obtained in obtainNextDrawable() takes its role.
++    if (upscaleActive() ? !mFrameDirty : !mCurrentDrawable)
+     {
+         ANGLE_TRY(obtainNextDrawable(context));
+     }
+@@ -597,8 +637,12 @@
+ {
+     ASSERT(mMetalLayer);
+ 
+-    gl::Extents size(static_cast<int>(mMetalLayer.get().drawableSize.width),
+-                     static_cast<int>(mMetalLayer.get().drawableSize.height), 1);
++    CGSize dsize = mMetalLayer.get().drawableSize;
++    if (upscaleActive())
++    {
++        dsize = calcInternalSize(dsize);
++    }
++    gl::Extents size(static_cast<int>(dsize.width), static_cast<int>(dsize.height), 1);
+ 
+     ANGLE_TRY(SurfaceMtl::ensureCompanionTexturesSizeCorrect(context, size));
+ 
+@@ -685,6 +729,19 @@
+             contextMtl->onBackbufferResized(context, this);
+         }
+ 
++        if (upscaleActive())
++        {
++            // Render into a persistent offscreen texture at the internal
++            // resolution; the drawable is only obtained at swap time.
++            ANGLE_TRY(ensureOffscreenColorTexture(context));
++            mColorTextureInitialized = false;
++            mFrameDirty              = true;
++
++            ANGLE_TRY(ensureCompanionTexturesSizeCorrect(context));
++
++            return angle::Result::Continue;
++        }
++
+         mCurrentDrawable = [mMetalLayer nextDrawable];
+         if (!mCurrentDrawable)
+         {
+@@ -721,6 +778,20 @@
+ 
+ angle::Result WindowSurfaceMtl::swapImpl(const gl::Context *context)
+ {
++    if (upscaleActive())
++    {
++        if (mFrameDirty)
++        {
++            ANGLE_TRY(encodeUpscaleAndPresent(context));
++            mFrameDirty = false;
++        }
++        if (mDepthTexture || mStencilTexture)
++        {
++            mDepthStencilTexturesInitialized = false;
++        }
++        return angle::Result::Continue;
++    }
++
+     if (mCurrentDrawable)
+     {
+         ASSERT(mColorTexture);
+@@ -749,6 +820,151 @@
+     return angle::Result::Continue;
+ }
+ 
++CGSize WindowSurfaceMtl::calcInternalSize(const CGSize &drawableSize) const
++{
++    // Must match librw's mapMetalFXSize() (src/gl/gl3device.cpp). The lower
++    // clamp keeps the spatial scaler's per-axis factor within its [1,2] range.
++    int outW = static_cast<int>(drawableSize.width);
++    int outH = static_cast<int>(drawableSize.height);
++    int pct  = static_cast<int>(mUpscalePct);
++    int inW  = std::max((outW + 1) / 2, std::min(outW, outW * pct / 100));
++    int inH  = std::max((outH + 1) / 2, std::min(outH, outH * pct / 100));
++    return CGSizeMake(inW, inH);
++}
++
++angle::Result WindowSurfaceMtl::ensureOffscreenColorTexture(const gl::Context *context)
++{
++    CGSize internalSize = calcInternalSize(mMetalLayer.get().drawableSize);
++    gl::Extents size(static_cast<int>(internalSize.width), static_cast<int>(internalSize.height),
++                     1);
++
++    if (!mColorTexture || mColorTexture->sizeAt0() != size)
++    {
++        // renderTargetOnly=false: the scaler input needs MTLTextureUsageShaderRead
++        ANGLE_TRY(CreateOrResizeTexture(context, mColorFormat, size.width, size.height, 1,
++                                        /** renderTargetOnly */ false, &mColorTexture));
++        mColorRenderTarget.setWithImplicitMSTexture(mColorTexture, mMSColorTexture,
++                                                    mtl::kZeroNativeMipLevel, 0, mColorFormat);
++    }
++
++    return angle::Result::Continue;
++}
++
++angle::Result WindowSurfaceMtl::encodeUpscaleAndPresent(const gl::Context *context)
++{
++    ANGLE_MTL_OBJC_SCOPE
++    {
++        ContextMtl *contextMtl = mtl::GetImpl(context);
++        ASSERT(mColorTexture);
++
++        if (mMSColorTexture)
++        {
++            ANGLE_TRY(resolveColorTextureIfNeeded(context));
++        }
++
++        // Obtain the drawable only now, at present time.
++        mCurrentDrawable = [mMetalLayer nextDrawable];
++        if (!mCurrentDrawable)
++        {
++            mMetalLayer.get().allowsNextDrawableTimeout = NO;
++            mCurrentDrawable                            = [mMetalLayer nextDrawable];
++            mMetalLayer.get().allowsNextDrawableTimeout = YES;
++        }
++
++        id<MTLTexture> dst = mCurrentDrawable.get().texture;
++        id<MTLTexture> src = mColorTexture->get();
++
++        bool useScaler = false;
++#if ANGLE_METAL_FX_AVAILABLE
++        if (@available(macOS 13.0, macCatalyst 16.0, *))
++        {
++            CGSize inSize  = CGSizeMake(src.width, src.height);
++            CGSize outSize = CGSizeMake(dst.width, dst.height);
++            if (!CGSizeEqualToSize(inSize, outSize))
++            {
++                if (!mSpatialScaler || !CGSizeEqualToSize(mScalerInputSize, inSize) ||
++                    !CGSizeEqualToSize(mScalerOutputSize, outSize))
++                {
++                    auto desc = angle::adoptObjCPtr([[MTLFXSpatialScalerDescriptor alloc] init]);
++                    desc.get().inputWidth          = static_cast<NSUInteger>(inSize.width);
++                    desc.get().inputHeight         = static_cast<NSUInteger>(inSize.height);
++                    desc.get().outputWidth         = static_cast<NSUInteger>(outSize.width);
++                    desc.get().outputHeight        = static_cast<NSUInteger>(outSize.height);
++                    desc.get().colorTextureFormat  = mColorFormat.metalFormat;
++                    desc.get().outputTextureFormat = mColorFormat.metalFormat;
++                    // Both the BGRA8 and the EDR RGBA16F path carry
++                    // sRGB-encoded values (see the colorspace note in
++                    // initialize()), which is what Perceptual expects.
++                    MTLFXSpatialScalerColorProcessingMode mode =
++                        MTLFXSpatialScalerColorProcessingModePerceptual;
++                    const char *modeStr = getenv("ANGLE_METAL_FX_MODE");
++                    if (modeStr != nullptr && modeStr[0] == 'l')
++                    {
++                        mode = MTLFXSpatialScalerColorProcessingModeLinear;
++                    }
++                    else if (modeStr != nullptr && modeStr[0] == 'h')
++                    {
++                        mode = MTLFXSpatialScalerColorProcessingModeHDR;
++                    }
++                    desc.get().colorProcessingMode = mode;
++
++                    mSpatialScaler = angle::adoptObjCPtr([desc.get()
++                        newSpatialScalerWithDevice:contextMtl->getDisplay()->getMetalDevice()]);
++                    mScalerInputSize  = inSize;
++                    mScalerOutputSize = outSize;
++                }
++                useScaler = mSpatialScaler != nil;
++            }
++        }
++
++        if (useScaler)
++        {
++            if (@available(macOS 13.0, macCatalyst 16.0, *))
++            {
++                id<MTLFXSpatialScaler> scaler = mSpatialScaler.get();
++                scaler.colorTexture           = src;
++                scaler.outputTexture          = dst;
++                contextMtl->presentWithPreEncode(context, mCurrentDrawable,
++                                                 [scaler](id<MTLCommandBuffer> cmdBuffer) {
++                                                     [scaler encodeToCommandBuffer:cmdBuffer];
++                                                 });
++            }
++        }
++#endif
++        if (!useScaler)
++        {
++            // No scaler (creation failed or internal size == drawable size):
++            // draw-blit the offscreen texture into the drawable instead.
++            mtl::TextureRef drawableTex = mtl::Texture::MakeFromMetal(dst);
++            RenderTargetMtl drawableRenderTarget;
++            drawableRenderTarget.set(drawableTex, mtl::kZeroNativeMipLevel, 0, mColorFormat);
++            mtl::RenderCommandEncoder *encoder =
++                contextMtl->getRenderTargetCommandEncoder(drawableRenderTarget);
++
++            mtl::ColorBlitParams params;
++            params.enabledBuffers.set(0);
++            params.filter         = GL_LINEAR;
++            params.src            = mColorTexture;
++            params.dstTextureSize = gl::Extents(static_cast<int>(dst.width),
++                                                static_cast<int>(dst.height), 1);
++            params.dstRect = params.dstScissorRect =
++                gl::Rectangle(0, 0, params.dstTextureSize.width, params.dstTextureSize.height);
++            params.srcNormalizedCoords = mtl::NormalizedCoords();
++            ANGLE_TRY(contextMtl->getDisplay()->getUtils().blitColorWithDraw(
++                context, encoder, mColorFormat.actualAngleFormat(), params));
++            contextMtl->endEncoding(true);
++            contextMtl->present(context, mCurrentDrawable);
++        }
++
++        StopFrameCapture();
++        StartFrameCapture(contextMtl);
++
++        mCurrentDrawable = nil;
++
++        return angle::Result::Continue;
++    }
++}
++
+ // OffscreenSurfaceMtl implementation
+ OffscreenSurfaceMtl::OffscreenSurfaceMtl(DisplayMtl *display,
+                                          const egl::SurfaceState &state,
+--- a/src/libANGLE/renderer/metal/ContextMtl.h
++++ b/src/libANGLE/renderer/metal/ContextMtl.h
+@@ -340,6 +340,12 @@
+ 
+     void flushCommandBuffer(mtl::CommandBufferFinishOperation operation);
+     void present(const gl::Context *context, id<CAMetalDrawable> presentationDrawable);
++    // Same as present(), but invokes preEncode with the command buffer after
++    // encoding ends and before the present is scheduled — used by
++    // WindowSurfaceMtl to encode the MetalFX upscale pass.
++    void presentWithPreEncode(const gl::Context *context,
++                              id<CAMetalDrawable> presentationDrawable,
++                              const std::function<void(id<MTLCommandBuffer>)> &preEncode);
+     angle::Result finishCommandBuffer();
+ 
+     void addCommandBufferScheduledCallback(std::function<void()> callback);
+--- a/src/libANGLE/renderer/metal/ContextMtl.mm
++++ b/src/libANGLE/renderer/metal/ContextMtl.mm
+@@ -1810,6 +1810,13 @@
+ 
+ void ContextMtl::present(const gl::Context *context, id<CAMetalDrawable> presentationDrawable)
+ {
++    presentWithPreEncode(context, presentationDrawable, nullptr);
++}
++
++void ContextMtl::presentWithPreEncode(const gl::Context *context,
++                                      id<CAMetalDrawable> presentationDrawable,
++                                      const std::function<void(id<MTLCommandBuffer>)> &preEncode)
++{
+     ensureCommandBufferReady();
+ 
+     FramebufferMtl *currentframebuffer = mtl::GetImpl(getState().getDrawFramebuffer());
+@@ -1819,6 +1826,10 @@
+     }
+ 
+     endEncoding(false);
++    if (preEncode)
++    {
++        preEncode(mCmdBuffer.get());
++    }
+     mCmdBuffer.present(presentationDrawable);
+     mCmdBuffer.commit(mtl::NoWait);
+     mRenderPassesSinceFlush = 0;
+--- a/src/libANGLE/renderer/metal/BUILD.gn
++++ b/src/libANGLE/renderer/metal/BUILD.gn
+@@ -185,6 +185,10 @@
+     ]
+     if (is_mac) {
+       frameworks += [ "Cocoa.framework" ]
++
++      # MetalFX spatial upscaling (angle-metalfx.patch); weak because ANGLE's
++      # deployment target predates macOS 13.
++      weak_frameworks = [ "MetalFX.framework" ]
+     }
+   }
+ }

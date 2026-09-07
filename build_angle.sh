@@ -37,20 +37,23 @@ export PATH
 
 cd "$ANGLE_DIR"
 
-# local patch (FP16 EDR backbuffer); applied to the working tree only,
-# the submodule commit stays pinned upstream
-EDR_PATCH="$LIBRW_DIR/angle-edr.patch"
-if [ -f "$EDR_PATCH" ]; then
-	if git apply --check "$EDR_PATCH" 2>/dev/null; then
-		git apply "$EDR_PATCH"
-		echo "applied angle-edr.patch"
-	elif git apply --reverse --check "$EDR_PATCH" 2>/dev/null; then
-		echo "angle-edr.patch already applied"
+# local patches (FP16 EDR backbuffer, MetalFX upscaling); applied to the
+# working tree only, the submodule commit stays pinned upstream.
+# angle-metalfx.patch is generated against a tree with angle-edr.patch
+# applied, so the order matters.
+for patch_name in angle-edr.patch angle-metalfx.patch; do
+	PATCH="$LIBRW_DIR/$patch_name"
+	[ -f "$PATCH" ] || continue
+	if git apply --check "$PATCH" 2>/dev/null; then
+		git apply "$PATCH"
+		echo "applied $patch_name"
+	elif git apply --reverse --check "$PATCH" 2>/dev/null; then
+		echo "$patch_name already applied"
 	else
-		echo "error: angle-edr.patch does not apply to $ANGLE_DIR" >&2
+		echo "error: $patch_name does not apply to $ANGLE_DIR" >&2
 		exit 1
 	fi
-fi
+done
 
 # one-time dependency sync (several GB); stamp only on success so an
 # interrupted sync is resumed on the next run

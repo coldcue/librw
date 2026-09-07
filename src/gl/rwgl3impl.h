@@ -69,6 +69,7 @@ struct GlGlobals
 	int currentMode;
 	int presentWidth, presentHeight;
 	int presentOffX, presentOffY;
+	int metalFXPct;		// MetalFX render scale in percent, 0 = off
 
 	// for opening the window
 	int winWidth, winHeight;

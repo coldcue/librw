@@ -1263,6 +1263,8 @@ getFramebufferRect(Raster *frameBuffer)
 		SDL_GetWindowSize(glGlobals.window, &r.w, &r.h);
 #elif defined(LIBRW_GLFW)
 		glfwGetFramebufferSize(glGlobals.window, &r.w, &r.h);
+		// with MetalFX active the EGL surface is smaller than the window
+		mapMetalFXSize(&r.w, &r.h);
 #else
 		missing implementation
 #endif
@@ -1887,18 +1889,28 @@ makeVideoModeList(GLFWmonitor *monitor)
 	}
 }
 
-// ANGLE (GLES on Metal), mac only; set DISABLE_ANGLE to force native GL
+// ANGLE (GLES on Metal), mac only
 #if defined(__APPLE__) && defined(GLFW_ANGLE_PLATFORM_TYPE) && defined(GLFW_CONTEXT_CREATION_API)
 #define LIBRW_ANGLE
 #endif
 
-#ifdef LIBRW_ANGLE
-static bool
-useAngle(void)
+void
+mapMetalFXSize(int32 *w, int32 *h)
 {
-	return getenv("DISABLE_ANGLE") == nil;
+	// Must match WindowSurfaceMtl::calcInternalSize() (angle-metalfx.patch).
+	// The lower clamp keeps the spatial scaler's per-axis factor within [1,2].
+	int32 pct = glGlobals.metalFXPct;
+	if(pct == 0)
+		return;
+	int32 mw = *w * pct / 100;
+	int32 mh = *h * pct / 100;
+	if(mw > *w) mw = *w;
+	if(mh > *h) mh = *h;
+	if(mw < (*w + 1) / 2) mw = (*w + 1) / 2;
+	if(mh < (*h + 1) / 2) mh = (*h + 1) / 2;
+	*w = mw;
+	*h = mh;
 }
-#endif
 
 static int
 openGLFW(EngineOpenParams *openparams)
@@ -1911,8 +1923,7 @@ openGLFW(EngineOpenParams *openparams)
 	memset(&gl3Caps, 0, sizeof(gl3Caps));
 
 #ifdef LIBRW_ANGLE
-	if(useAngle())
-		glfwInitHint(GLFW_ANGLE_PLATFORM_TYPE, GLFW_ANGLE_PLATFORM_TYPE_METAL);
+	glfwInitHint(GLFW_ANGLE_PLATFORM_TYPE, GLFW_ANGLE_PLATFORM_TYPE_METAL);
 #endif
 
 	/* Init GLFW */
@@ -1982,10 +1993,10 @@ startGLFW(void)
 
 	int tryAngle = 0;
 #ifdef LIBRW_ANGLE
-	tryAngle = useAngle();
+	tryAngle = 1;
 	// FP16 EDR backbuffer (see angle-edr.patch); must be set before the
 	// EGL surface is created. Set DISABLE_EDR to keep the 8-bit backbuffer.
-	if(tryAngle && getenv("DISABLE_EDR") == nil)
+	if(getenv("DISABLE_EDR") == nil)
 		setenv("ANGLE_METAL_EDR", "1", 1);
 	else
 		unsetenv("ANGLE_METAL_EDR");
@@ -2025,6 +2036,10 @@ startGLFW(void)
 		RWERROR((ERR_GENERAL, "glfwCreateWindow() failed"));
 		return 0;
 	}
+#ifdef LIBRW_ANGLE
+	// tryAngle survives the retry loop only if the ANGLE attempt succeeded
+	gl3Caps.usingAngle = tryAngle != 0;
+#endif
 	glfwMakeContextCurrent(win);
 
 	/* Init GLAD */
@@ -2052,6 +2067,32 @@ startGLFW(void)
 	}
 	if(gl3Caps.floatBackbuffer)
 		fprintf(stderr, "EDR: FP16 backbuffer active\n");
+
+	glGlobals.metalFXPct = 0;
+#ifdef LIBRW_ANGLE
+	// MetalFX upscaling (see angle-metalfx.patch); the env var is set by the
+	// application before the device is created.
+	if(gl3Caps.usingAngle && getenv("ANGLE_METAL_FX")){
+		glGlobals.metalFXPct = atoi(getenv("ANGLE_METAL_FX"));
+		if(glGlobals.metalFXPct < 50 || glGlobals.metalFXPct >= 100)
+			glGlobals.metalFXPct = 0;
+	}
+	if(glGlobals.metalFXPct){
+		// The initial GL viewport equals the EGL surface size. An ANGLE build
+		// without angle-metalfx.patch keeps the surface at full size; upscaling
+		// would then shrink the image into a corner, so turn it off instead.
+		GLint vp[4];
+		int32 mw, mh;
+		glGetIntegerv(GL_VIEWPORT, vp);
+		glfwGetFramebufferSize(win, &mw, &mh);
+		mapMetalFXSize(&mw, &mh);
+		if(vp[2] != mw || vp[3] != mh){
+			fprintf(stderr, "MetalFX: ANGLE build lacks angle-metalfx.patch, upscaling disabled\n");
+			glGlobals.metalFXPct = 0;
+		}else
+			fprintf(stderr, "MetalFX: rendering at %d%% (%dx%d)\n", glGlobals.metalFXPct, mw, mh);
+	}
+#endif
 
 	glGlobals.window = win;
 	*glGlobals.pWindow = win;
