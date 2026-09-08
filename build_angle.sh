@@ -1,5 +1,7 @@
 #!/bin/sh
 # Build ANGLE (libEGL/libGLESv2) from vendor/angle with its own gclient/gn/ninja toolchain.
+# vendor/angle tracks the coldcue/angle fork (revc branch), which carries the
+# FP16 EDR backbuffer and MetalFX upscaling changes as commits.
 # Usage: build_angle.sh [DESTDIR]; env overrides: ANGLE_DIR, ANGLE_OUT, ANGLE_GN_ARGS, DEPOT_TOOLS
 set -e
 
@@ -36,24 +38,6 @@ PATH="$DEPOT_TOOLS:$PATH"
 export PATH
 
 cd "$ANGLE_DIR"
-
-# local patches (FP16 EDR backbuffer, MetalFX upscaling); applied to the
-# working tree only, the submodule commit stays pinned upstream.
-# angle-metalfx.patch is generated against a tree with angle-edr.patch
-# applied, so the order matters.
-for patch_name in angle-edr.patch angle-metalfx.patch; do
-	PATCH="$LIBRW_DIR/$patch_name"
-	[ -f "$PATCH" ] || continue
-	if git apply --check "$PATCH" 2>/dev/null; then
-		git apply "$PATCH"
-		echo "applied $patch_name"
-	elif git apply --reverse --check "$PATCH" 2>/dev/null; then
-		echo "$patch_name already applied"
-	else
-		echo "error: $patch_name does not apply to $ANGLE_DIR" >&2
-		exit 1
-	fi
-done
 
 # one-time dependency sync (several GB); stamp only on success so an
 # interrupted sync is resumed on the next run
