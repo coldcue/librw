@@ -121,6 +121,14 @@ im2DSetXform(void)
 	xform[1] = -2.0f/cam->frameBuffer->height;
 	xform[2] = -1.0f;
 	xform[3] = 1.0f;
+	// MetalFX temporal upscaling: 2D must carry the same sub-pixel jitter as
+	// the projection (see beginUpdate), otherwise HUD/menu elements visibly
+	// bob when the scaler removes the jitter from the frame.
+	if(glGlobals.metalFXTemporal && cam->frameBuffer &&
+	   cam->frameBuffer->parent->type == Raster::CAMERA){
+		xform[2] += glGlobals.mfxJitterSignX * 2.0f*glGlobals.mfxJitterX / cam->frameBuffer->width;
+		xform[3] += glGlobals.mfxJitterSignY * 2.0f*glGlobals.mfxJitterY / cam->frameBuffer->height;
+	}
 	setUniform(u_xform, xform);
 //	glUniform4fv(currentShader->uniformLocations[u_xform], 1, xform);
 }

@@ -16,6 +16,12 @@
 #include "rwgl3shader.h"
 #include "rwgl3impl.h"
 
+// ANGLE (GLES on Metal), mac only
+#if defined(__APPLE__) && defined(GLFW_ANGLE_PLATFORM_TYPE) && defined(GLFW_CONTEXT_CREATION_API)
+#define LIBRW_ANGLE
+#include <dlfcn.h>
+#endif
+
 #define PLUGIN_ID 0
 
 namespace rw {
@@ -1301,6 +1307,151 @@ setViewport(Raster *frameBuffer)
 	}
 }
 
+#ifdef LIBRW_ANGLE
+
+// MetalFX temporal upscaling. librw owns the sub-pixel jitter sequence and,
+// right before each swap, pushes the frame's jitter and a reprojection matrix
+// (current Metal clip pos -> previous Metal clip pos) into ANGLE, which feeds
+// them to the MTLFXTemporalScaler (see angle-metalfx.patch).
+
+// All mat4 helpers below use GL column-major float[16], same as devView/devProj.
+
+static void
+mfxMat4Mult(float *dst, const float *a, const float *b)
+{
+	float tmp[16];
+	for(int c = 0; c < 4; c++)
+		for(int r = 0; r < 4; r++)
+			tmp[c*4+r] = a[0*4+r]*b[c*4+0] + a[1*4+r]*b[c*4+1] +
+			             a[2*4+r]*b[c*4+2] + a[3*4+r]*b[c*4+3];
+	memcpy(dst, tmp, sizeof(tmp));
+}
+
+static bool
+mfxMat4Invert(float *inv, const float *m)
+{
+	inv[0] = m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] +
+	         m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+	inv[4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] -
+	         m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+	inv[8] = m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] +
+	         m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+	inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] -
+	          m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+	inv[1] = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] -
+	         m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+	inv[5] = m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] +
+	         m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+	inv[9] = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] -
+	         m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+	inv[13] = m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] +
+	          m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+	inv[2] = m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15] +
+	         m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6];
+	inv[6] = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15] -
+	         m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6];
+	inv[10] = m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15] +
+	          m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5];
+	inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14] -
+	          m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5];
+	inv[3] = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11] -
+	         m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6];
+	inv[7] = m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11] +
+	         m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6];
+	inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11] -
+	          m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5];
+	inv[15] = m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10] +
+	          m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
+
+	float det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
+	if(det == 0.0f)
+		return false;
+	det = 1.0f/det;
+	for(int i = 0; i < 16; i++)
+		inv[i] *= det;
+	return true;
+}
+
+// base-b radical inverse of a 1-based index, in [0,1)
+static float
+mfxHalton(int index, int base)
+{
+	float f = 1.0f, r = 0.0f;
+	while(index > 0){
+		f /= base;
+		r += f*(index % base);
+		index /= base;
+	}
+	return r;
+}
+
+// Capture the unjittered view-proj of the frame's main (CAMERA raster) camera
+// in Metal clip conventions; called from beginUpdate().
+static void
+mfxCaptureViewProj(Camera *cam, const float *view, const float *proj)
+{
+	// GL clip z in [-w,w] -> Metal clip z in [0,w]
+	static const float zfix[16] = {
+		1.0f, 0.0f, 0.0f, 0.0f,
+		0.0f, 1.0f, 0.0f, 0.0f,
+		0.0f, 0.0f, 0.5f, 0.0f,
+		0.0f, 0.0f, 0.5f, 1.0f,
+	};
+	float vp[16];
+	mfxMat4Mult(vp, proj, view);
+	mfxMat4Mult((float*)&glGlobals.mfxCurViewProj, zfix, vp);
+
+	Matrix *ltm = cam->getFrame()->getLTM();
+	glGlobals.mfxCurCamPos = ltm->pos;
+	glGlobals.mfxCurCamAt = ltm->at;
+	glGlobals.mfxHaveCur = true;
+}
+
+// Called from showRaster() right before the buffer swap.
+static void
+mfxPushFrameParams(void)
+{
+	float reproj[16];
+	int motionValid = 0;
+	int reset = 0;
+
+	if(glGlobals.mfxHaveCur && glGlobals.mfxHavePrev){
+		float inv[16];
+		if(mfxMat4Invert(inv, (float*)&glGlobals.mfxCurViewProj)){
+			mfxMat4Mult(reproj, (float*)&glGlobals.mfxPrevViewProj, inv);
+			motionValid = 1;
+		}
+
+		// Camera-cut heuristic: a large jump or turn means the history and
+		// the reprojection are meaningless, so have the scaler start fresh.
+		V3d d = sub(glGlobals.mfxCurCamPos, glGlobals.mfxPrevCamPos);
+		if(length(d) > 10.0f ||
+		   dot(glGlobals.mfxCurCamAt, glGlobals.mfxPrevCamAt) < 0.866f)
+			reset = 1;
+	}
+	if(!motionValid)
+		memset(reproj, 0, sizeof(reproj));
+
+	glGlobals.metalFXSetFrameParams(reproj,
+		glGlobals.mfxJitterX, glGlobals.mfxJitterY, reset, motionValid);
+
+	if(glGlobals.mfxHaveCur){
+		glGlobals.mfxPrevViewProj = glGlobals.mfxCurViewProj;
+		glGlobals.mfxPrevCamPos = glGlobals.mfxCurCamPos;
+		glGlobals.mfxPrevCamAt = glGlobals.mfxCurCamAt;
+		glGlobals.mfxHavePrev = true;
+		glGlobals.mfxHaveCur = false;
+	}else
+		glGlobals.mfxHavePrev = false;
+
+	// Advance the jitter for the next frame.
+	glGlobals.mfxHaltonIndex = glGlobals.mfxHaltonIndex % glGlobals.mfxJitterPhases + 1;
+	glGlobals.mfxJitterX = mfxHalton(glGlobals.mfxHaltonIndex, 2) - 0.5f;
+	glGlobals.mfxJitterY = mfxHalton(glGlobals.mfxHaltonIndex, 3) - 0.5f;
+}
+
+#endif
+
 static void
 beginUpdate(Camera *cam)
 {
@@ -1362,6 +1513,23 @@ beginUpdate(Camera *cam)
 		proj[15] = 1.0f;
 	}
 	memcpy(&cam->devProj, &proj, sizeof(RawMatrix));
+
+#ifdef LIBRW_ANGLE
+	if(glGlobals.metalFXTemporal && cam->projection == Camera::PERSPECTIVE &&
+	   cam->frameBuffer && cam->frameBuffer->parent->type == Raster::CAMERA){
+		// devProj above stays unjittered; the reprojection matrix must not
+		// contain the jitter.
+		mfxCaptureViewProj(cam, view, proj);
+
+		// Sub-pixel jitter: with proj[11] = 1 (w = view z) a constant added
+		// to proj[8]/proj[9] is a constant NDC offset. Deliberately not
+		// mirrored into proj[12]/proj[13] -- that coupling implements the
+		// view-window shear of viewOffset, not a jitter.
+		Rect r = getFramebufferRect(cam->frameBuffer);
+		proj[8] += glGlobals.mfxJitterSignX * 2.0f*glGlobals.mfxJitterX / r.w;
+		proj[9] += glGlobals.mfxJitterSignY * 2.0f*glGlobals.mfxJitterY / r.h;
+	}
+#endif
 	setProjectionMatrix(proj);
 
 	if(rwStateCache.fogStart != cam->fogPlane){
@@ -1442,6 +1610,10 @@ showRaster(Raster *raster, uint32 flags)
 		glfwSwapInterval(1);
 	else
 		glfwSwapInterval(0);
+#ifdef LIBRW_ANGLE
+	if(glGlobals.metalFXTemporal)
+		mfxPushFrameParams();
+#endif
 	glfwSwapBuffers(glGlobals.window);
 #else
 	not implemented
@@ -1889,25 +2061,22 @@ makeVideoModeList(GLFWmonitor *monitor)
 	}
 }
 
-// ANGLE (GLES on Metal), mac only
-#if defined(__APPLE__) && defined(GLFW_ANGLE_PLATFORM_TYPE) && defined(GLFW_CONTEXT_CREATION_API)
-#define LIBRW_ANGLE
-#endif
-
 void
 mapMetalFXSize(int32 *w, int32 *h)
 {
 	// Must match WindowSurfaceMtl::calcInternalSize() (angle-metalfx.patch).
-	// The lower clamp keeps the spatial scaler's per-axis factor within [1,2].
+	// The lower clamp keeps the per-axis factor within the scaler's range:
+	// [1,2] for spatial, up to 3x for temporal running sub-50%.
 	int32 pct = glGlobals.metalFXPct;
 	if(pct == 0)
 		return;
+	int32 div = glGlobals.metalFXUltra ? 3 : 2;
 	int32 mw = *w * pct / 100;
 	int32 mh = *h * pct / 100;
 	if(mw > *w) mw = *w;
 	if(mh > *h) mh = *h;
-	if(mw < (*w + 1) / 2) mw = (*w + 1) / 2;
-	if(mh < (*h + 1) / 2) mh = (*h + 1) / 2;
+	if(mw < (*w + div - 1) / div) mw = (*w + div - 1) / div;
+	if(mh < (*h + div - 1) / div) mh = (*h + div - 1) / div;
 	*w = mw;
 	*h = mh;
 }
@@ -2069,13 +2238,21 @@ startGLFW(void)
 		fprintf(stderr, "EDR: FP16 backbuffer active\n");
 
 	glGlobals.metalFXPct = 0;
+	glGlobals.metalFXUltra = 0;
 #ifdef LIBRW_ANGLE
-	// MetalFX upscaling (see angle-metalfx.patch); the env var is set by the
+	// MetalFX upscaling (see angle-metalfx.patch); the env vars are set by the
 	// application before the device is created.
 	if(gl3Caps.usingAngle && getenv("ANGLE_METAL_FX")){
 		glGlobals.metalFXPct = atoi(getenv("ANGLE_METAL_FX"));
-		if(glGlobals.metalFXPct < 50 || glGlobals.metalFXPct >= 100)
+		if(glGlobals.metalFXPct < 33 || glGlobals.metalFXPct >= 100)
 			glGlobals.metalFXPct = 0;
+		// sub-50% needs the temporal scaler's 3x range
+		if(glGlobals.metalFXPct && glGlobals.metalFXPct < 50){
+			if(getenv("ANGLE_METAL_FX_TEMPORAL"))
+				glGlobals.metalFXUltra = 1;
+			else
+				glGlobals.metalFXPct = 50;
+		}
 	}
 	if(glGlobals.metalFXPct){
 		// The initial GL viewport equals the EGL surface size. An ANGLE build
@@ -2086,11 +2263,54 @@ startGLFW(void)
 		glGetIntegerv(GL_VIEWPORT, vp);
 		glfwGetFramebufferSize(win, &mw, &mh);
 		mapMetalFXSize(&mw, &mh);
+		if((vp[2] != mw || vp[3] != mh) && glGlobals.metalFXUltra){
+			// ANGLE clamps sub-50% back to 50 when temporal mode can't come
+			// up (no 3x device support, MSAA config); mirror that.
+			glGlobals.metalFXUltra = 0;
+			glGlobals.metalFXPct = 50;
+			glfwGetFramebufferSize(win, &mw, &mh);
+			mapMetalFXSize(&mw, &mh);
+		}
 		if(vp[2] != mw || vp[3] != mh){
 			fprintf(stderr, "MetalFX: ANGLE build lacks angle-metalfx.patch, upscaling disabled\n");
 			glGlobals.metalFXPct = 0;
+			glGlobals.metalFXUltra = 0;
 		}else
 			fprintf(stderr, "MetalFX: rendering at %d%% (%dx%d)\n", glGlobals.metalFXPct, mw, mh);
+	}
+
+	// Temporal mode: probe the ANGLE exports; an old dylib without the
+	// temporal patch simply lacks them and we stay on spatial upscaling.
+	glGlobals.metalFXTemporal = 0;
+	if(glGlobals.metalFXPct && getenv("ANGLE_METAL_FX_TEMPORAL")){
+		glGlobals.metalFXStatus =
+			(int (*)(void))dlsym(RTLD_DEFAULT, "rwANGLEMetalFXTemporalStatus");
+		glGlobals.metalFXSetFrameParams =
+			(void (*)(const float*, float, float, int, int))
+			dlsym(RTLD_DEFAULT, "rwANGLEMetalFXSetFrameParams");
+		if(glGlobals.metalFXStatus && glGlobals.metalFXSetFrameParams &&
+		   glGlobals.metalFXStatus() == 1){
+			glGlobals.metalFXTemporal = 1;
+			glGlobals.mfxHavePrev = false;
+			glGlobals.mfxHaveCur = false;
+			// recommended length is 8*(per-axis scale)^2: 32 covers 2x,
+			// 72 covers the 3x of sub-50% mode
+			glGlobals.mfxJitterPhases = glGlobals.metalFXUltra ? 72 : 32;
+			glGlobals.mfxHaltonIndex = 1;
+			glGlobals.mfxJitterX = mfxHalton(1, 2) - 0.5f;
+			glGlobals.mfxJitterY = mfxHalton(1, 3) - 0.5f;
+			// Jitter sign calibration knob, e.g. RW_MFX_JITTER=+- (x then y).
+			// Default +- : GL NDC y up vs. the top-down drawable.
+			glGlobals.mfxJitterSignX = 1.0f;
+			glGlobals.mfxJitterSignY = -1.0f;
+			const char *signs = getenv("RW_MFX_JITTER");
+			if(signs && signs[0] && signs[1]){
+				glGlobals.mfxJitterSignX = signs[0] == '-' ? -1.0f : 1.0f;
+				glGlobals.mfxJitterSignY = signs[1] == '-' ? -1.0f : 1.0f;
+			}
+			fprintf(stderr, "MetalFX: temporal upscaling active\n");
+		}else
+			fprintf(stderr, "MetalFX: temporal upscaling unavailable, using spatial\n");
 	}
 #endif
 

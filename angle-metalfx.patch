@@ -1,15 +1,83 @@
+diff --git a/src/libANGLE/renderer/metal/BUILD.gn b/src/libANGLE/renderer/metal/BUILD.gn
+index 8e4c836b00..51a7c0e496 100644
+--- a/src/libANGLE/renderer/metal/BUILD.gn
++++ b/src/libANGLE/renderer/metal/BUILD.gn
+@@ -185,6 +185,10 @@ angle_source_set("angle_metal_backend") {
+     ]
+     if (is_mac) {
+       frameworks += [ "Cocoa.framework" ]
++
++      # MetalFX spatial upscaling (angle-metalfx.patch); weak because ANGLE's
++      # deployment target predates macOS 13.
++      weak_frameworks = [ "MetalFX.framework" ]
+     }
+   }
+ }
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.h b/src/libANGLE/renderer/metal/ContextMtl.h
+index 4ea4a3cc12..2d82a96cf9 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.h
++++ b/src/libANGLE/renderer/metal/ContextMtl.h
+@@ -340,6 +340,12 @@ class ContextMtl : public ContextImpl, public mtl::Context
+ 
+     void flushCommandBuffer(mtl::CommandBufferFinishOperation operation);
+     void present(const gl::Context *context, id<CAMetalDrawable> presentationDrawable);
++    // Same as present(), but invokes preEncode with the command buffer after
++    // encoding ends and before the present is scheduled — used by
++    // WindowSurfaceMtl to encode the MetalFX upscale pass.
++    void presentWithPreEncode(const gl::Context *context,
++                              id<CAMetalDrawable> presentationDrawable,
++                              const std::function<void(id<MTLCommandBuffer>)> &preEncode);
+     angle::Result finishCommandBuffer();
+ 
+     void addCommandBufferScheduledCallback(std::function<void()> callback);
+diff --git a/src/libANGLE/renderer/metal/ContextMtl.mm b/src/libANGLE/renderer/metal/ContextMtl.mm
+index 497701140d..78d55d7341 100644
+--- a/src/libANGLE/renderer/metal/ContextMtl.mm
++++ b/src/libANGLE/renderer/metal/ContextMtl.mm
+@@ -1809,6 +1809,13 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+ }
+ 
+ void ContextMtl::present(const gl::Context *context, id<CAMetalDrawable> presentationDrawable)
++{
++    presentWithPreEncode(context, presentationDrawable, nullptr);
++}
++
++void ContextMtl::presentWithPreEncode(const gl::Context *context,
++                                      id<CAMetalDrawable> presentationDrawable,
++                                      const std::function<void(id<MTLCommandBuffer>)> &preEncode)
+ {
+     ensureCommandBufferReady();
+ 
+@@ -1819,6 +1826,10 @@ GLint GetOwnershipIdentity(const egl::AttributeMap &attribs)
+     }
+ 
+     endEncoding(false);
++    if (preEncode)
++    {
++        preEncode(mCmdBuffer.get());
++    }
+     mCmdBuffer.present(presentationDrawable);
+     mCmdBuffer.commit(mtl::NoWait);
+     mRenderPassesSinceFlush = 0;
+diff --git a/src/libANGLE/renderer/metal/SurfaceMtl.h b/src/libANGLE/renderer/metal/SurfaceMtl.h
+index 004de337a6..40d0f80553 100644
 --- a/src/libANGLE/renderer/metal/SurfaceMtl.h
 +++ b/src/libANGLE/renderer/metal/SurfaceMtl.h
-@@ -19,6 +19,8 @@
+@@ -19,9 +19,13 @@
  #include "libANGLE/renderer/metal/mtl_resources.h"
  #include "libANGLE/renderer/metal/mtl_state_cache.h"
  
 +@protocol MTLFXSpatialScaler;
++@protocol MTLFXTemporalScaler;
 +
  namespace rx
  {
  
-@@ -173,6 +175,14 @@
++class ContextMtl;
+ class DisplayMtl;
+ 
+ #define ANGLE_TO_EGL_TRY(EXPR)                                 \
+@@ -173,6 +177,24 @@ class WindowSurfaceMtl : public SurfaceMtl
      // Check if metal layer has been resized.
      bool checkIfLayerResized(const gl::Context *context);
  
@@ -20,11 +88,21 @@
 +    CGSize calcInternalSize(const CGSize &drawableSize) const;
 +    angle::Result ensureOffscreenColorTexture(const gl::Context *context);
 +    angle::Result encodeUpscaleAndPresent(const gl::Context *context);
++    // Temporal upscaling (ANGLE_METAL_FX_TEMPORAL=1 in addition to
++    // ANGLE_METAL_FX): needs per-frame jitter/reprojection data pushed by the
++    // client through rwANGLEMetalFXSetFrameParams() (see SurfaceMtl.mm).
++    bool ensureTemporalResources(ContextMtl *contextMtl,
++                                 id<MTLTexture> src,
++                                 id<MTLTexture> dst);
++    bool encodeTemporalAndPresent(const gl::Context *context,
++                                  id<MTLTexture> src,
++                                  id<MTLTexture> dst);
++    void dropTemporal();
 +
      angle::ObjCPtr<CAMetalLayer> mMetalLayer = nil;
      CALayer *mLayer;
      angle::ObjCPtr<id<CAMetalDrawable>> mCurrentDrawable = nil;
-@@ -183,6 +193,14 @@
+@@ -183,6 +205,21 @@ class WindowSurfaceMtl : public SurfaceMtl
      CGSize mCurrentKnownDrawableSize;
  
      bool mRetainBuffer = false;
@@ -33,12 +111,21 @@
 +    angle::ObjCPtr<id<MTLFXSpatialScaler>> mSpatialScaler = nil;
 +    CGSize mScalerInputSize  = CGSizeMake(0, 0);
 +    CGSize mScalerOutputSize = CGSizeMake(0, 0);
++    // Temporal mode; falls back to the spatial path when unavailable or when
++    // scaler creation fails (mUpscaleTemporal is then cleared).
++    bool mUpscaleTemporal = false;
++    angle::ObjCPtr<id<MTLFXTemporalScaler>> mTemporalScaler        = nil;
++    angle::ObjCPtr<id<MTLTexture>> mMotionTexture                  = nil;
++    angle::ObjCPtr<id<MTLTexture>> mDepthCopyTexture               = nil;
++    angle::ObjCPtr<id<MTLRenderPipelineState>> mMotionPassPipeline = nil;
 +    // Whether the offscreen color texture has been handed out for rendering
 +    // since the last swap; replaces mCurrentDrawable as the per-frame marker.
 +    bool mFrameDirty = false;
  };
  
  // Offscreen surface, base class of PBuffer.
+diff --git a/src/libANGLE/renderer/metal/SurfaceMtl.mm b/src/libANGLE/renderer/metal/SurfaceMtl.mm
+index d0f36a86cd..c322a55e24 100644
 --- a/src/libANGLE/renderer/metal/SurfaceMtl.mm
 +++ b/src/libANGLE/renderer/metal/SurfaceMtl.mm
 @@ -20,6 +20,13 @@
@@ -55,7 +142,95 @@
  // Compiler can turn on programmatical frame capture in release build by defining
  // ANGLE_METAL_FRAME_CAPTURE flag.
  #if defined(NDEBUG) && !defined(ANGLE_METAL_FRAME_CAPTURE)
-@@ -422,6 +429,22 @@
+@@ -74,6 +81,87 @@
+     return angle::Result::Continue;
+ }
+ 
++// MetalFX temporal upscaling: per-frame parameters pushed by the client
++// (librw) through the rwANGLEMetalFX* exports at the bottom of this file.
++// The client calls rwANGLEMetalFXSetFrameParams() on the GL thread right
++// before eglSwapBuffers(), which consumes the values on the same thread, so
++// no locking is needed.
++struct MetalFXFrameParams
++{
++    float reproj[16] = {};           // cur Metal clip pos -> prev Metal clip pos, column major
++    float jitterX     = 0.0f;        // pixels at the internal resolution, [-0.5, 0.5]
++    float jitterY     = 0.0f;
++    int reset         = 0;           // 1 = drop temporal history (camera cut)
++    int motionValid   = 0;           // 0 = reprojection matrix unusable this frame
++};
++MetalFXFrameParams gMetalFXFrameParams;
++int gMetalFXTemporalActive = 0;
++
++// Constant buffer of the motion pass below; layout matches the MSL Params.
++struct alignas(16) MotionPassParams
++{
++    float reproj[16];
++    float size[2];     // internal size in pixels
++    float invSize[2];
++    int motionValid;
++    int pad[3];
++};
++
++// Fullscreen pass deriving the temporal scaler's inputs from the depth
++// buffer: camera-only motion vectors (reprojection of depth through the
++// pushed matrix) and a single-sample depth copy in a format the scaler
++// accepts. Motion is in top-left-origin pixels with scale 1: a surface point
++// that moved down-right by 10px since the previous frame gets (-10,-10).
++constexpr char kMotionPassSource[] = R"(
++#include <metal_stdlib>
++using namespace metal;
++
++struct Params {
++    float4x4 reproj;
++    float2 size;
++    float2 invSize;
++    int motionValid;
++};
++
++struct VSOut { float4 pos [[position]]; };
++
++vertex VSOut mfxMotionVS(uint vid [[vertex_id]])
++{
++    VSOut o;
++    float2 uv = float2((vid << 1) & 2, vid & 2);
++    o.pos = float4(uv * 2.0 - 1.0, 0.0, 1.0);
++    return o;
++}
++
++struct FSOut {
++    float2 motion [[color(0)]];
++    float depth [[color(1)]];
++};
++
++fragment FSOut mfxMotionFS(VSOut in [[stage_in]],
++                           depth2d<float, access::read> depthTex [[texture(0)]],
++                           constant Params &p [[buffer(0)]])
++{
++    FSOut o;
++    float d = depthTex.read(uint2(in.pos.xy));
++    o.depth = d;
++    o.motion = float2(0.0);
++    if (p.motionValid != 0) {
++        // Pixel center -> Metal NDC (y up); depth is already Metal [0,1].
++        float2 ndc = float2(in.pos.x * p.invSize.x * 2.0 - 1.0,
++                            1.0 - in.pos.y * p.invSize.y * 2.0);
++        float4 prevClip = p.reproj * float4(ndc, d, 1.0);
++        if (prevClip.w > 0.0) {
++            float2 prevNdc = prevClip.xy / prevClip.w;
++            float2 prevPix = float2((prevNdc.x * 0.5 + 0.5) * p.size.x,
++                                    (0.5 - prevNdc.y * 0.5) * p.size.y);
++            o.motion = prevPix - in.pos.xy;
++        }
++    }
++    return o;
++}
++)";
++
+ }  // anonymous namespace
+ 
+ // SurfaceMtl implementation
+@@ -422,6 +510,54 @@
  {
      // NOTE(hqle): Width and height attributes is ignored for now.
      mCurrentKnownDrawableSize = CGSizeMake(0, 0);
@@ -67,10 +242,42 @@
 +        if (pctStr != nullptr)
 +        {
 +            int pct = atoi(pctStr);
-+            // 50% is the smallest scale the [1,2] spatial-scaler range allows
-+            if (pct >= 50 && pct < 100)
++            // 33% is the smallest scale the temporal scaler's 3x range
++            // allows; sub-50% is clamped back to the spatial [1,2] range
++            // below unless temporal mode actually comes up.
++            if (pct >= 33 && pct < 100)
 +            {
 +                mUpscalePct = static_cast<uint32_t>(pct);
++            }
++        }
++
++        // Temporal mode additionally needs single-sample depth (the client
++        // disables MSAA when requesting it; a stale MSAA config falls back to
++        // spatial) and the per-frame data channel driven by the client.
++        if (mUpscalePct != 0 && mSamples <= 1 && getenv("ANGLE_METAL_FX_TEMPORAL") != nullptr &&
++            [MTLFXTemporalScalerDescriptor supportsDevice:display->getMetalDevice()])
++        {
++            mUpscaleTemporal       = true;
++            gMetalFXTemporalActive = 1;
++        }
++
++        // Sub-50% needs temporal mode and a device that can scale 3x.
++        if (mUpscalePct != 0 && mUpscalePct < 50)
++        {
++            bool ultraOk = false;
++            if (mUpscaleTemporal)
++            {
++                if (@available(macOS 14.0, macCatalyst 17.0, *))
++                {
++                    ultraOk = [MTLFXTemporalScalerDescriptor
++                                  supportedInputContentMaxScaleForDevice:display
++                                                                             ->getMetalDevice()] >=
++                              3.0f;
++                }
++            }
++            if (!ultraOk)
++            {
++                mUpscalePct = 50;
 +            }
 +        }
 +    }
@@ -78,15 +285,16 @@
  }
  
  WindowSurfaceMtl::~WindowSurfaceMtl() {}
-@@ -431,6 +462,7 @@
+@@ -431,6 +567,8 @@
      SurfaceMtl::destroy(display);
  
      mCurrentDrawable = nil;
 +    mSpatialScaler   = nil;
++    dropTemporal();
      if (mMetalLayer && mMetalLayer.get() != mLayer)
      {
          // If we created metal layer in WindowSurfaceMtl::initialize(),
-@@ -536,8 +568,14 @@
+@@ -536,8 +674,14 @@
  // size can change with client window resizing
  gl::Extents WindowSurfaceMtl::getSize() const
  {
@@ -103,7 +311,7 @@
  }
  
  EGLint WindowSurfaceMtl::getSwapBehavior() const
-@@ -585,7 +623,9 @@
+@@ -585,7 +729,9 @@
  
  angle::Result WindowSurfaceMtl::ensureCurrentDrawableObtained(const gl::Context *context)
  {
@@ -114,7 +322,7 @@
      {
          ANGLE_TRY(obtainNextDrawable(context));
      }
-@@ -597,8 +637,12 @@
+@@ -597,8 +743,12 @@
  {
      ASSERT(mMetalLayer);
  
@@ -129,7 +337,7 @@
  
      ANGLE_TRY(SurfaceMtl::ensureCompanionTexturesSizeCorrect(context, size));
  
-@@ -685,6 +729,19 @@
+@@ -685,6 +835,19 @@
              contextMtl->onBackbufferResized(context, this);
          }
  
@@ -149,7 +357,7 @@
          mCurrentDrawable = [mMetalLayer nextDrawable];
          if (!mCurrentDrawable)
          {
-@@ -721,6 +778,20 @@
+@@ -721,6 +884,20 @@
  
  angle::Result WindowSurfaceMtl::swapImpl(const gl::Context *context)
  {
@@ -170,19 +378,21 @@
      if (mCurrentDrawable)
      {
          ASSERT(mColorTexture);
-@@ -749,6 +820,151 @@
+@@ -749,6 +926,341 @@
      return angle::Result::Continue;
  }
  
 +CGSize WindowSurfaceMtl::calcInternalSize(const CGSize &drawableSize) const
 +{
 +    // Must match librw's mapMetalFXSize() (src/gl/gl3device.cpp). The lower
-+    // clamp keeps the spatial scaler's per-axis factor within its [1,2] range.
++    // clamp keeps the per-axis factor within the scaler's range: [1,2] for
++    // spatial, up to 3x for a temporal scaler running sub-50%.
 +    int outW = static_cast<int>(drawableSize.width);
 +    int outH = static_cast<int>(drawableSize.height);
 +    int pct  = static_cast<int>(mUpscalePct);
-+    int inW  = std::max((outW + 1) / 2, std::min(outW, outW * pct / 100));
-+    int inH  = std::max((outH + 1) / 2, std::min(outH, outH * pct / 100));
++    int div  = (mUpscaleTemporal && pct < 50) ? 3 : 2;
++    int inW  = std::max((outW + div - 1) / div, std::min(outW, outW * pct / 100));
++    int inH  = std::max((outH + div - 1) / div, std::min(outH, outH * pct / 100));
 +    return CGSizeMake(inW, inH);
 +}
 +
@@ -227,6 +437,23 @@
 +
 +        id<MTLTexture> dst = mCurrentDrawable.get().texture;
 +        id<MTLTexture> src = mColorTexture->get();
++
++#if ANGLE_METAL_FX_AVAILABLE
++        if (mUpscaleTemporal)
++        {
++            if (encodeTemporalAndPresent(context, src, dst))
++            {
++                StopFrameCapture();
++                StartFrameCapture(contextMtl);
++                mCurrentDrawable = nil;
++                return angle::Result::Continue;
++            }
++            // Scaler/pipeline creation failed: permanently fall back to the
++            // spatial path. The status export flips to 0 so the client stops
++            // jittering its projection.
++            dropTemporal();
++        }
++#endif
 +
 +        bool useScaler = false;
 +#if ANGLE_METAL_FX_AVAILABLE
@@ -319,61 +546,210 @@
 +    }
 +}
 +
++bool WindowSurfaceMtl::ensureTemporalResources(ContextMtl *contextMtl,
++                                               id<MTLTexture> src,
++                                               id<MTLTexture> dst)
++{
++#if ANGLE_METAL_FX_AVAILABLE
++    if (@available(macOS 13.0, macCatalyst 16.0, *))
++    {
++        CGSize inSize  = CGSizeMake(src.width, src.height);
++        CGSize outSize = CGSizeMake(dst.width, dst.height);
++        if (mTemporalScaler && CGSizeEqualToSize(mScalerInputSize, inSize) &&
++            CGSizeEqualToSize(mScalerOutputSize, outSize))
++        {
++            return true;
++        }
++
++        id<MTLDevice> device = contextMtl->getDisplay()->getMetalDevice();
++
++        auto desc = angle::adoptObjCPtr([[MTLFXTemporalScalerDescriptor alloc] init]);
++        desc.get().inputWidth          = static_cast<NSUInteger>(inSize.width);
++        desc.get().inputHeight         = static_cast<NSUInteger>(inSize.height);
++        desc.get().outputWidth         = static_cast<NSUInteger>(outSize.width);
++        desc.get().outputHeight        = static_cast<NSUInteger>(outSize.height);
++        desc.get().colorTextureFormat  = mColorFormat.metalFormat;
++        desc.get().outputTextureFormat = mColorFormat.metalFormat;
++        desc.get().depthTextureFormat  = MTLPixelFormatR32Float;
++        desc.get().motionTextureFormat = MTLPixelFormatRG16Float;
++        desc.get().autoExposureEnabled = NO;
++        // Compile the final upscaler in the background; the interim one used
++        // for the first frames is slower but produces the same image.
++        desc.get().requiresSynchronousInitialization = NO;
++
++        // A newly created scaler has no history, so no reset is needed here.
++        mTemporalScaler = angle::adoptObjCPtr([desc.get() newTemporalScalerWithDevice:device]);
++        if (!mTemporalScaler)
++        {
++            return false;
++        }
++        mScalerInputSize  = inSize;
++        mScalerOutputSize = outSize;
++
++        // Motion vectors and the depth copy at the internal size.
++        MTLTextureDescriptor *texDesc = [MTLTextureDescriptor
++            texture2DDescriptorWithPixelFormat:MTLPixelFormatRG16Float
++                                         width:static_cast<NSUInteger>(inSize.width)
++                                        height:static_cast<NSUInteger>(inSize.height)
++                                     mipmapped:NO];
++        texDesc.usage       = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
++        texDesc.storageMode = MTLStorageModePrivate;
++        mMotionTexture      = angle::adoptObjCPtr([device newTextureWithDescriptor:texDesc]);
++        texDesc.pixelFormat = MTLPixelFormatR32Float;
++        mDepthCopyTexture   = angle::adoptObjCPtr([device newTextureWithDescriptor:texDesc]);
++        if (!mMotionTexture || !mDepthCopyTexture)
++        {
++            return false;
++        }
++
++        if (!mMotionPassPipeline)
++        {
++            NSError *error = nil;
++            auto library   = angle::adoptObjCPtr([device
++                newLibraryWithSource:[NSString stringWithUTF8String:kMotionPassSource]
++                             options:nil
++                               error:&error]);
++            if (!library)
++            {
++                NSLog(@"MetalFX temporal: motion pass compile failed: %@", error);
++                return false;
++            }
++            auto vertexFn   = angle::adoptObjCPtr([library.get() newFunctionWithName:@"mfxMotionVS"]);
++            auto fragmentFn = angle::adoptObjCPtr([library.get() newFunctionWithName:@"mfxMotionFS"]);
++            auto pipeDesc   = angle::adoptObjCPtr([[MTLRenderPipelineDescriptor alloc] init]);
++            pipeDesc.get().vertexFunction                  = vertexFn.get();
++            pipeDesc.get().fragmentFunction                = fragmentFn.get();
++            pipeDesc.get().colorAttachments[0].pixelFormat = MTLPixelFormatRG16Float;
++            pipeDesc.get().colorAttachments[1].pixelFormat = MTLPixelFormatR32Float;
++            mMotionPassPipeline = angle::adoptObjCPtr(
++                [device newRenderPipelineStateWithDescriptor:pipeDesc.get() error:&error]);
++            if (!mMotionPassPipeline)
++            {
++                NSLog(@"MetalFX temporal: motion pipeline creation failed: %@", error);
++                return false;
++            }
++        }
++        return true;
++    }
++#endif
++    return false;
++}
++
++bool WindowSurfaceMtl::encodeTemporalAndPresent(const gl::Context *context,
++                                                id<MTLTexture> src,
++                                                id<MTLTexture> dst)
++{
++#if ANGLE_METAL_FX_AVAILABLE
++    if (@available(macOS 13.0, macCatalyst 16.0, *))
++    {
++        ContextMtl *contextMtl = mtl::GetImpl(context);
++        if (!mDepthTexture || !ensureTemporalResources(contextMtl, src, dst))
++        {
++            return false;
++        }
++
++        const MetalFXFrameParams params = gMetalFXFrameParams;
++
++        id<MTLFXTemporalScaler> scaler = mTemporalScaler.get();
++        scaler.colorTexture            = src;
++        scaler.depthTexture            = mDepthCopyTexture.get();
++        scaler.motionTexture           = mMotionTexture.get();
++        scaler.outputTexture           = dst;
++        scaler.inputContentWidth       = static_cast<NSUInteger>(mScalerInputSize.width);
++        scaler.inputContentHeight      = static_cast<NSUInteger>(mScalerInputSize.height);
++        scaler.jitterOffsetX           = params.jitterX;
++        scaler.jitterOffsetY           = params.jitterY;
++        scaler.motionVectorScaleX      = 1.0f;
++        scaler.motionVectorScaleY      = 1.0f;
++        scaler.depthReversed           = NO;
++        scaler.reset                   = (params.reset || !params.motionValid) ? YES : NO;
++
++        MotionPassParams gpuParams;
++        std::copy(std::begin(params.reproj), std::end(params.reproj),
++                  std::begin(gpuParams.reproj));
++        gpuParams.size[0]     = static_cast<float>(mScalerInputSize.width);
++        gpuParams.size[1]     = static_cast<float>(mScalerInputSize.height);
++        gpuParams.invSize[0]  = 1.0f / gpuParams.size[0];
++        gpuParams.invSize[1]  = 1.0f / gpuParams.size[1];
++        gpuParams.motionValid = params.motionValid;
++
++        id<MTLRenderPipelineState> pipeline = mMotionPassPipeline.get();
++        id<MTLTexture> depthSrc             = mDepthTexture->get();
++        id<MTLTexture> motionTex            = mMotionTexture.get();
++        id<MTLTexture> depthCopyTex         = mDepthCopyTexture.get();
++
++        contextMtl->presentWithPreEncode(
++            context, mCurrentDrawable, [=](id<MTLCommandBuffer> cmdBuffer) {
++                MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
++                pass.colorAttachments[0].texture     = motionTex;
++                pass.colorAttachments[0].loadAction  = MTLLoadActionDontCare;
++                pass.colorAttachments[0].storeAction = MTLStoreActionStore;
++                pass.colorAttachments[1].texture     = depthCopyTex;
++                pass.colorAttachments[1].loadAction  = MTLLoadActionDontCare;
++                pass.colorAttachments[1].storeAction = MTLStoreActionStore;
++                id<MTLRenderCommandEncoder> encoder =
++                    [cmdBuffer renderCommandEncoderWithDescriptor:pass];
++                encoder.label = @"MetalFX motion pass";
++                [encoder setRenderPipelineState:pipeline];
++                [encoder setFragmentTexture:depthSrc atIndex:0];
++                [encoder setFragmentBytes:&gpuParams length:sizeof(gpuParams) atIndex:0];
++                [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
++                [encoder endEncoding];
++
++                [scaler encodeToCommandBuffer:cmdBuffer];
++            });
++        return true;
++    }
++#endif
++    return false;
++}
++
++void WindowSurfaceMtl::dropTemporal()
++{
++    mTemporalScaler     = nil;
++    mMotionTexture      = nil;
++    mDepthCopyTexture   = nil;
++    mMotionPassPipeline = nil;
++    if (mUpscaleTemporal)
++    {
++        mUpscaleTemporal       = false;
++        gMetalFXTemporalActive = 0;
++    }
++}
++
  // OffscreenSurfaceMtl implementation
  OffscreenSurfaceMtl::OffscreenSurfaceMtl(DisplayMtl *display,
                                           const egl::SurfaceState &state,
---- a/src/libANGLE/renderer/metal/ContextMtl.h
-+++ b/src/libANGLE/renderer/metal/ContextMtl.h
-@@ -340,6 +340,12 @@
+@@ -849,3 +1361,32 @@
+ }
  
-     void flushCommandBuffer(mtl::CommandBufferFinishOperation operation);
-     void present(const gl::Context *context, id<CAMetalDrawable> presentationDrawable);
-+    // Same as present(), but invokes preEncode with the command buffer after
-+    // encoding ends and before the present is scheduled — used by
-+    // WindowSurfaceMtl to encode the MetalFX upscale pass.
-+    void presentWithPreEncode(const gl::Context *context,
-+                              id<CAMetalDrawable> presentationDrawable,
-+                              const std::function<void(id<MTLCommandBuffer>)> &preEncode);
-     angle::Result finishCommandBuffer();
- 
-     void addCommandBufferScheduledCallback(std::function<void()> callback);
---- a/src/libANGLE/renderer/metal/ContextMtl.mm
-+++ b/src/libANGLE/renderer/metal/ContextMtl.mm
-@@ -1810,6 +1810,13 @@
- 
- void ContextMtl::present(const gl::Context *context, id<CAMetalDrawable> presentationDrawable)
- {
-+    presentWithPreEncode(context, presentationDrawable, nullptr);
+ }  // namespace rx
++
++// MetalFX temporal upscaling: C exports for the client (librw), resolved with
++// dlsym(). Both are called on the GL thread; SetFrameParams right before
++// eglSwapBuffers(), which consumes the values on the same thread.
++extern "C" __attribute__((visibility("default"))) int rwANGLEMetalFXTemporalStatus(void)
++{
++    return rx::gMetalFXTemporalActive;
 +}
 +
-+void ContextMtl::presentWithPreEncode(const gl::Context *context,
-+                                      id<CAMetalDrawable> presentationDrawable,
-+                                      const std::function<void(id<MTLCommandBuffer>)> &preEncode)
++extern "C" __attribute__((visibility("default"))) void rwANGLEMetalFXSetFrameParams(
++    const float reprojMatrix[16],
++    float jitterX,
++    float jitterY,
++    int reset,
++    int motionValid)
 +{
-     ensureCommandBufferReady();
- 
-     FramebufferMtl *currentframebuffer = mtl::GetImpl(getState().getDrawFramebuffer());
-@@ -1819,6 +1826,10 @@
-     }
- 
-     endEncoding(false);
-+    if (preEncode)
++// The caller always passes a float[16]; there is no bounds information to
++// carry across this C ABI boundary.
++#pragma clang unsafe_buffer_usage begin
++    for (int i = 0; i < 16; i++)
 +    {
-+        preEncode(mCmdBuffer.get());
++        rx::gMetalFXFrameParams.reproj[i] = reprojMatrix[i];
 +    }
-     mCmdBuffer.present(presentationDrawable);
-     mCmdBuffer.commit(mtl::NoWait);
-     mRenderPassesSinceFlush = 0;
---- a/src/libANGLE/renderer/metal/BUILD.gn
-+++ b/src/libANGLE/renderer/metal/BUILD.gn
-@@ -185,6 +185,10 @@
-     ]
-     if (is_mac) {
-       frameworks += [ "Cocoa.framework" ]
-+
-+      # MetalFX spatial upscaling (angle-metalfx.patch); weak because ANGLE's
-+      # deployment target predates macOS 13.
-+      weak_frameworks = [ "MetalFX.framework" ]
-     }
-   }
- }
++#pragma clang unsafe_buffer_usage end
++    rx::gMetalFXFrameParams.jitterX     = jitterX;
++    rx::gMetalFXFrameParams.jitterY     = jitterY;
++    rx::gMetalFXFrameParams.reset       = reset;
++    rx::gMetalFXFrameParams.motionValid = motionValid;
++}

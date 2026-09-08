@@ -71,6 +71,24 @@ struct GlGlobals
 	int presentOffX, presentOffY;
 	int metalFXPct;		// MetalFX render scale in percent, 0 = off
 
+	// MetalFX temporal upscaling (angle-metalfx.patch): librw owns the jitter
+	// sequence and pushes per-frame reprojection data into ANGLE before swap
+	// through these dlsym'd exports.
+	int metalFXTemporal;
+	int metalFXUltra;	// sub-50% temporal: size floor is 1/3 instead of 1/2
+	int mfxJitterPhases;	// Halton cycle length, >= 8*(scale factor)^2
+	int (*metalFXStatus)(void);
+	void (*metalFXSetFrameParams)(const float reproj[16],
+		float jitterX, float jitterY, int reset, int motionValid);
+	RawMatrix mfxPrevViewProj;	// Metal-clip view-proj of the previous frame
+	RawMatrix mfxCurViewProj;
+	V3d mfxPrevCamPos, mfxCurCamPos;	// for the camera-cut heuristic
+	V3d mfxPrevCamAt, mfxCurCamAt;
+	bool mfxHavePrev, mfxHaveCur;
+	float mfxJitterX, mfxJitterY;	// current frame's jitter in pixels
+	float mfxJitterSignX, mfxJitterSignY;
+	int mfxHaltonIndex;
+
 	// for opening the window
 	int winWidth, winHeight;
 	const char *winTitle;
